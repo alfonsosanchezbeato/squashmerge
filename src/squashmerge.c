@@ -85,9 +85,11 @@ enum patch_format
 	PATCH_UNKNOWN = 0,
 
 	PATCH_VCDIFF,
+	PATCH_BSDIFF,
 };
 
-const unsigned char vcdiff_magic[3] = {0xd6, 0xc3, 0xc4};
+const unsigned char vcdiff_magic[] = {0xd6, 0xc3, 0xc4};
+const unsigned char bsdiff_magic[] = {'B', 'S', 'D', 'I', 'F', 'F', '4', '0'};
 
 int read_patch_format(const struct mmap_file* f, size_t offset)
 {
@@ -96,9 +98,14 @@ int read_patch_format(const struct mmap_file* f, size_t offset)
 	hdr = mmap_read(f, offset, sizeof(vcdiff_magic));
 	if (!hdr)
 		return PATCH_UNKNOWN;
-
 	if (!memcmp(hdr, vcdiff_magic, sizeof(vcdiff_magic)))
 		return PATCH_VCDIFF;
+
+	hdr = mmap_read(f, offset, sizeof(bsdiff_magic));
+	if (!hdr)
+		return PATCH_UNKNOWN;
+	if (!memcmp(hdr, bsdiff_magic, sizeof(bsdiff_magic)))
+		return PATCH_BSDIFF;
 
 	fprintf(stderr, "Unknown delta format (only vcdiff"
 			" is supported at the moment).\n");
@@ -385,7 +392,7 @@ int run_xdelta3(struct mmap_file* patch, struct mmap_file* output,
 		}
 
 		if (execlp("xdelta3",
-					"xdelta3", "-c", "-d", "-s", input_path, 0) == -1)
+			   "xdelta3", "-c", "-d", "-s", input_path, (char *) NULL) == -1)
 		{
 			fprintf(stderr, "execlp() failed\n"
 					"\terrno: %s\n", strerror(errno));
@@ -563,6 +570,7 @@ int main(int argc, char* argv[])
 					sizeof(dh) + block_list_size);
 			if (pformat == PATCH_UNKNOWN)
 				break;
+			fprintf(stderr, "Diff format is %s\n", pformat == PATCH_VCDIFF? "xdelta3": "bsdiff");
 
 			/* open target before chdir() */
 			target_f = mmap_create_without_mapping(target_file);
