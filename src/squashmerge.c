@@ -15,6 +15,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <arpa/inet.h> /* for endian conversion */
@@ -415,6 +416,79 @@ int run_xdelta3(struct mmap_file* patch, struct mmap_file* output,
 	return 1;
 }
 
+int run_bspatch(const char *input_file, const char *output_file, const char *patch_file) {
+	pid_t child_pid = fork();
+
+	if (child_pid == -1)
+	{
+		fprintf(stderr, "fork() failed\n"
+				"\terrno: %s\n", strerror(errno));
+		return 0;
+	}
+
+	if (child_pid == 0)
+	{
+		/* child */
+		if (execlp("bspatch",
+			   "bspatch", input_file, output_file, patch_file, (char *) NULL) == -1)
+		{
+			fprintf(stderr, "execlp() failed\n"
+					"\terrno: %s\n", strerror(errno));
+			exit(1);
+		}
+	}
+	else
+	{
+		int ret;
+		waitpid(child_pid, &ret, 0);
+
+		if (WEXITSTATUS(ret) != 0)
+		{
+			fprintf(stderr, "Child exited with non-success status\n"
+					"\texit status: %d\n", WEXITSTATUS(ret));
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+static int write_fd_to_file(int fd, const char *output_file)
+{
+	FILE *out_fp;
+	char buffer[8192];
+	ssize_t bytes_read;
+	size_t bytes_written;
+
+	out_fp = fopen(output_file, "wb");
+	if (!out_fp) {
+		perror("fopen");
+		return -1;
+	}
+
+	while ((bytes_read = read(fd, buffer, sizeof(buffer))) > 0) {
+		bytes_written = fwrite(buffer, 1, bytes_read, out_fp);
+		if (bytes_written != (size_t)bytes_read) {
+			perror("fwrite");
+			fclose(out_fp);
+			return -1;
+		}
+	}
+
+	if (bytes_read == -1) {
+		perror("read");
+		fclose(out_fp);
+		return -1;
+	}
+
+	if (fclose(out_fp) != 0) {
+		perror("fclose");
+		return -1;
+	}
+
+	return 0;
+}
+
 void* compress_blocks(void* data)
 {
 	struct compress_data_private* pd = data;
@@ -551,10 +625,13 @@ int main(int argc, char* argv[])
 		do
 		{
 			struct compressed_block* source_blocks;
-			char tmp_name_buf[] = "tmp.XXXXXX";
+                        char tmp_name_buf[] = "tmp.XXXXXX";
+			char tmp_patch_file[] = "patch.tmp";
 			size_t tmp_length = 0;
 			size_t block_list_size;
-			enum patch_format pformat;
+                        enum patch_format pformat;
+			char cwd[PATH_MAX] = {0};
+			char target_path[PATH_MAX] = {0};
 
 			struct sqdelta_header dh = read_sqdelta_header(&patch_f, 0);
 			if (dh.magic == 0)
@@ -572,10 +649,11 @@ int main(int argc, char* argv[])
 				break;
 			fprintf(stderr, "Diff format is %s\n", pformat == PATCH_VCDIFF? "xdelta3": "bsdiff");
 
-			/* open target before chdir() */
-			target_f = mmap_create_without_mapping(target_file);
-			if (target_f.fd == -1)
+                        if (getcwd(cwd, sizeof cwd) == NULL) {
+				fprintf(stderr, "Cannot retrieve current working directory");
 				break;
+			}
+			snprintf(target_path, sizeof target_path, "%s/%s", cwd, target_file);
 
 			do
 			{
@@ -633,18 +711,43 @@ int main(int argc, char* argv[])
 					switch (pformat)
 					{
 						case PATCH_VCDIFF:
+							// mmap now to use as stdin to xdelta3
+							target_f = mmap_create_without_mapping(target_path);
+                                                        if (target_f.fd == -1)
+								fprintf(stderr, "Cannot mmap target.\n"
+									"\terrno: %s\n", strerror(errno));
 							patch_ret = run_xdelta3(&patch_f, &target_f, tmp_name_buf);
-							break;
+                                                        break;
+                                                case PATCH_BSDIFF:
+							// tmp_name_buf: original expanded file
+							// target_path: result file, expanded
+							// Write non-headers to patch file
+                                                        if (write_fd_to_file(patch_f.fd, tmp_patch_file) != 0) {
+								fprintf(stderr, "Cannot write patch file.\n"
+									"\terrno: %s\n", strerror(errno));
+							}
+							patch_ret = run_bspatch(tmp_name_buf, target_path, tmp_patch_file);
+							if (!patch_ret) {
+								fprintf(stderr, "Error calling bspatch.\n");
+								break;
+							}
+							// Now mmap to get it squashed
+                                                        target_f = mmap_open(target_path);
+                                                        if (target_f.fd == -1)
+								fprintf(stderr, "Cannot mmap target.\n"
+									"\terrno: %s\n", strerror(errno));
+                                                        break;
 						case PATCH_UNKNOWN:
 							/* not reached */
 							patch_ret = 0;
 					}
 
-					if (!patch_ret)
-						break;
-
-					if (!mmap_map_created_file(&target_f))
-						break;
+					if (pformat == PATCH_VCDIFF) {
+						if (!patch_ret)
+							break;
+						if (!mmap_map_created_file(&target_f))
+							break;
+					}
 
 					if (squash_target_file(&target_f))
 						ret = 0;
